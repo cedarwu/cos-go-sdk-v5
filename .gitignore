@@ -27,3 +27,6 @@ cover.html
 cover.out
 covprofile
 coverage.html
+
+.idea/
+.vscode/

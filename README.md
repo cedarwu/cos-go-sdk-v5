@@ -4,7 +4,7 @@
 
 ## Install
 
-`go get -u github.com/tencentyun/cos-go-sdk-v5`
+`go get -u github.com/cedarwu/cos-go-sdk-v5`
 
 
 ## Usage

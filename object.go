@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 // ObjectService 相关 API
@@ -275,8 +277,20 @@ type Object struct {
 }
 
 type MultiUploadOptions struct {
-	OptIni   *InitiateMultipartUploadOptions
-	PartSize int
+	OptIni    *InitiateMultipartUploadOptions
+	PartSize  int
+	MaxThread int
+}
+
+type MultiUploadPartInfo struct {
+	partNumber int
+	data       io.Reader
+}
+
+type MultiUploadPartRspInfo struct {
+	partNumber int
+	rsp        *Response
+	err        error
 }
 
 // MultiUpload 为高级upload接口，并发分块上传
@@ -287,54 +301,89 @@ type MultiUploadOptions struct {
 
 func (s *ObjectService) MultiUpload(ctx context.Context, name string, r io.Reader, opt *MultiUploadOptions) (*CompleteMultipartUploadResult, *Response, error) {
 
+	if opt.MaxThread <= 0 {
+		opt.MaxThread = 1
+	}
 	optini := opt.OptIni
 	res, _, err := s.InitiateMultipartUpload(ctx, name, optini)
 	if err != nil {
-		panic(err)
+		return nil, nil, err
 	}
 	uploadID := res.UploadID
 	bufSize := opt.PartSize * 1024 * 1024
 	buffer := make([]byte, bufSize)
 	optcom := &CompleteMultipartUploadOptions{}
 
-	PartUpload := func(ch chan *Response, ctx context.Context, name string, uploadId string, partNumber int, data io.Reader, opt *ObjectUploadPartOptions) {
+	var etags sync.Map
+	var wg sync.WaitGroup
 
+	PartUpload := func(ctx context.Context, name string, uploadId string, reqChs chan *MultiUploadPartInfo, opt *ObjectUploadPartOptions) {
 		defer func() {
+			wg.Done()
 			if err := recover(); err != nil {
-				fmt.Println(err)
+				return
 			}
 		}()
-		resp, err := s.UploadPart(context.Background(), name, uploadId, partNumber, data, nil)
-		if err != nil {
-			panic(err)
+		for partInfo := range reqChs {
+			beginTime := time.Now()
+			fmt.Printf("upload part %d begin @%v\n", partInfo.partNumber, beginTime.Format("2006-01-02 15:04:05"))
+			rsp, err := s.UploadPart(context.Background(), name, uploadId, partInfo.partNumber, partInfo.data, nil)
+			/*
+			ch <- MultiUploadPartRspInfo{
+				partNumber: partInfo.partNumber,
+				rsp:        rsp,
+				err:        err,
+			}
+			*/
+			if err != nil {
+				fmt.Printf("upload part %d failed @%v, err: %v\n", partInfo.partNumber, time.Now().Format("2006-01-02 15:04:05"), err)
+				panic(err)
+			} else {
+				etags.Store(partInfo.partNumber, rsp.Header.Get("ETag"))
+				endTime := time.Now()
+				fmt.Printf("upload part %d succeed @%v, cost: %v\n", partInfo.partNumber, endTime.Format("2006-01-02 15:04:05"), endTime.Sub(beginTime))
+			}
 		}
-		ch <- resp
 	}
 
-	chs := make([]chan *Response, 10000)
-	PartNumber := 0
-	for i := 1; true; i++ {
+	reqChs := make(chan *MultiUploadPartInfo, 1)
+	for i := 0; i < opt.MaxThread; i++ {
+		wg.Add(1)
+		go PartUpload(context.Background(), name, uploadID, reqChs, nil)
+	}
+	for partNumber := 1; true; partNumber++ {
 		bytesread, err := r.Read(buffer)
 		if err != nil {
 			if err != io.EOF {
-				panic(err)
+				return nil, nil, err
 			}
-			PartNumber = i
 			break
 		}
-		chs[i] = make(chan *Response)
-		go PartUpload(chs[i], context.Background(), name, uploadID, i, strings.NewReader(string(buffer[:bytesread])), nil)
+		reqChs <- &MultiUploadPartInfo{
+			partNumber: partNumber,
+			data:       strings.NewReader(string(buffer[:bytesread])),
+		}
+		//fmt.Printf("add part %d @%v\n", partNumber, time.Now().Format("2006-01-02 15:04:05"))
+	}
+	close(reqChs)
+
+	wg.Wait()
+
+	if err != nil {
+		fmt.Println("upload err:", err)
 	}
 
-	for i := 1; i < PartNumber; i++ {
-		resp := <-chs[i]
-		etag := resp.Header.Get("ETag")
-		optcom.Parts = append(optcom.Parts, Object{
-			PartNumber: i, ETag: etag},
-		)
+	partNumber := 1
+	for ; true; partNumber++ {
+		if etag, ok := etags.Load(partNumber); !ok {
+			break
+		} else {
+			optcom.Parts = append(optcom.Parts, Object{PartNumber: partNumber, ETag: etag.(string)},
+			)
+		}
 	}
+	fmt.Println("combine part 1 to part", partNumber-1)
+	v, rsp, err := s.CompleteMultipartUpload(context.Background(), name, uploadID, optcom)
 
-	v, resp, err := s.CompleteMultipartUpload(context.Background(), name, uploadID, optcom)
-
-	return v, resp, err
+	return v, rsp, err
 }
